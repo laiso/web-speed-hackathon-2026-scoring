@@ -6,6 +6,16 @@ on:
   issue_comment:
     types:
       - created
+  workflow_dispatch:
+    inputs:
+      application_url:
+        description: "計測対象の URL"
+        required: true
+        type: string
+      sequence:
+        description: "空白区切りの計測対象 URL 列。指定時は同じジョブの中で順に計測する（ペア比較用）"
+        required: false
+        type: string
 env:
   TZ: "Asia/Tokyo"
 jobs:
@@ -72,3 +82,77 @@ jobs:
           PARTICIPATION_GITHUB_ID: ${{ github.event.issue.user.login }}
           DASHBOARD_SERVER_URL: ${{ secrets.DASHBOARD_SERVER_URL }}
           DASHBOARD_SERVER_TOKEN: ${{ secrets.DASHBOARD_SERVER_TOKEN }}
+
+  dispatch:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # renovate: tag=v4.2.2
+        with:
+          fetch-depth: 0
+      - run: |
+          curl https://mise.run | sh
+          echo "$HOME/.local/share/mise/bin" >> $GITHUB_PATH
+          echo "$HOME/.local/share/mise/shims" >> $GITHUB_PATH
+          mise install
+        working-directory: scoring-tool
+        env:
+          MISE_VERSION: "2025.12.0"
+      - run: |
+          pnpm install --frozen-lockfile
+        working-directory: scoring-tool
+      - name: Runner diagnostics
+        continue-on-error: true
+        run: |
+          echo "## runner"
+          echo "runner.name=${RUNNER_NAME} os=${RUNNER_OS} arch=${RUNNER_ARCH} nproc=$(nproc)"
+          grep -m1 'model name' /proc/cpuinfo || true
+          free -g | head -2
+          google-chrome --version || true
+          IP=$(curl -s --max-time 5 https://api.ipify.org || echo unknown)
+          echo "egress_ip=${IP}"
+          echo "## ip owner hint (ipinfo.io)"
+          INFO=$(curl -s --max-time 5 "https://ipinfo.io/${IP}/json" | jq -c '{ip,hostname,city,region,country,org}' 2>/dev/null)
+          echo "${INFO:-ipinfo: unavailable}"
+          echo "## Azure IMDS (169.254.169.254)"
+          AZ=$(curl -s --max-time 3 -H Metadata:true "http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01" | jq -c '{location,vmSize,zone}' 2>/dev/null)
+          echo "${AZ:-azure_imds: unreachable}"
+          echo "## AWS IMDSv2 (169.254.169.254)"
+          TOKEN=$(curl -s --max-time 3 -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60" -w '\n%{http_code}' 2>/dev/null || true)
+          CODE=$(echo "$TOKEN" | tail -1); TOKEN=$(echo "$TOKEN" | head -1)
+          AWSAZ=""
+          if [ "$CODE" = "200" ]; then
+            AWSAZ=$(curl -s --max-time 3 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone 2>/dev/null)
+          fi
+          if echo "$AWSAZ" | grep -qE '^[a-z]{2}(-[a-z]+)+-[0-9][a-z]$'; then echo "aws_imds: az=${AWSAZ}"; else echo "aws_imds: unreachable"; fi
+          echo "## targets (code / size / ttfb, sha256 先頭16桁)"
+          for u in $(echo "${SEQUENCE:-$TARGET_URL}" | tr ' ' '\n' | sort -u); do
+            curl -s -o /dev/null -D - --max-time 30 "${u%/}/" | grep -iE '^(cf-ray|server|fly-request-id|via):' | tr -d '\r' || true
+            for p in / "/api/v1/posts?limit=1" /scripts/main.js; do
+              curl -s -o /tmp/seq.bin --max-time 120 -w "warm ${u}${p} code=%{http_code} size=%{size_download} ttfb=%{time_starttransfer}s total=%{time_total}s\n" "${u%/}${p}"
+              echo "sha256=$(sha256sum /tmp/seq.bin | cut -c1-16)"
+            done
+          done
+        env:
+          TARGET_URL: ${{ inputs.application_url }}
+          SEQUENCE: ${{ inputs.sequence }}
+      - name: Scoring (same runner, in sequence)
+        run: |
+          n=0
+          for TARGET_URL in ${SEQUENCE:-$APPLICATION_URL}; do
+            n=$((n+1))
+            echo "### seq ${n} target=${TARGET_URL}"
+            echo "scoring start: $(date -Is)"
+            # GITHUB_ACTIONS があると Issue 前提の出力器が選ばれて失敗するので、外して端末用の出力にする。
+            # 競技期間の引数は渡さない（終了済みの期間を渡すと計測されない）。
+            env -u GITHUB_ACTIONS -u GITHUB_TOKEN pnpm start --applicationUrl "${TARGET_URL}"
+            echo "scoring end: $(date -Is)"
+            echo "### seq ${n} end"
+          done
+        working-directory: scoring-tool
+        env:
+          TZ: "Asia/Tokyo"
+          APPLICATION_URL: ${{ inputs.application_url }}
+          SEQUENCE: ${{ inputs.sequence }}
